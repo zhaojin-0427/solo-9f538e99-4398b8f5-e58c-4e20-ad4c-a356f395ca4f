@@ -453,7 +453,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         version: Annotated[int, PathParam(ge=1, description="Version number")],
     ) -> FileResponse:
-        record = store.get_download(get_settings(request), version)
+        current_settings = get_settings(request)
+        record = store.get_download(current_settings, version)
         if record is None:
             raise HTTPException(
                 status_code=404,
@@ -479,7 +480,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         responses={404: {"description": "Nothing published yet"}},
     )
     def download_current(request: Request) -> FileResponse:
-        record = store.get_current_download(get_settings(request))
+        current_settings = get_settings(request)
+        record = store.get_current_download(current_settings)
         if record is None:
             raise HTTPException(
                 status_code=404,
@@ -490,10 +492,105 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return _file_response(record)
 
+    @app.post(
+        "/api/v1/integrity/scans",
+        tags=["integrity"],
+        summary="Verify every registered version against its size and SHA-256",
+        description=(
+            "Hashes every version registered when the scan starts and compares the result "
+            "with the size and SHA-256 recorded at publication. Verdicts are saved per "
+            "version and returned as `ok`, `missing` or `corrupt` lists.\n\n"
+            "Versions found missing or corrupt stay readable through the metadata "
+            "endpoints but their downloads return 410 until a later scan sees the "
+            "original bytes again. If the version that is current when the scan starts "
+            "fails verification, and it is still current when the results are applied, "
+            "the current pointer moves to the newest older version that passed this same "
+            "scan; with no such version there is no current version (`current_version` "
+            "is 0).\n\n"
+            "Publications may continue while a scan runs: only versions registered at "
+            "scan start are checked, a version published during the scan is never rolled "
+            "back, and an unchecked version is never selected as a fallback."
+        ),
+        responses={
+            200: {"description": "Scan completed; verdict per version"},
+            503: {"description": "Another write transaction is still in progress"},
+        },
+    )
+    async def run_integrity_scan(request: Request) -> dict:
+        current_settings = get_settings(request)
+
+        def work() -> dict:
+            try:
+                return store.run_integrity_scan(current_settings)
+            except store.PublishBusy as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "scan_busy",
+                        "message": "another write transaction is in progress; retry shortly",
+                    },
+                ) from exc
+
+        return await run_in_threadpool(work)
+
+    @app.get(
+        "/api/v1/integrity/scans/latest",
+        tags=["integrity"],
+        summary="Summary of the most recent integrity scan",
+        responses={404: {"description": "No scan has run yet"}},
+    )
+    def latest_integrity_scan(request: Request) -> dict:
+        summary = store.latest_scan(get_settings(request))
+        if summary is None:
+            return error_response(
+                404, "no_integrity_scan", "no integrity scan has run yet"
+            )
+        return summary
+
+    @app.get(
+        "/api/v1/mosaics/{version}/integrity",
+        tags=["integrity"],
+        summary="Latest integrity verdict for one version",
+        responses={404: {"description": "Unknown version"}},
+    )
+    def version_integrity(
+        request: Request,
+        version: Annotated[int, PathParam(ge=1, description="Version number")],
+    ) -> dict:
+        verdict = store.get_integrity(get_settings(request), version)
+        if verdict is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"version {version} does not exist",
+                },
+            )
+        return {"version": version, **verdict}
+
     return app
 
 
 def _file_response(record: store.DownloadRecord) -> FileResponse:
+    if not record.downloadable:
+        log.warning(
+            "refusing download of version %s: integrity status %s",
+            record.version,
+            record.integrity_status,
+        )
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "image_unavailable",
+                "message": (
+                    f"image for version {record.version} failed integrity verification "
+                    "and is unavailable for download"
+                ),
+                "version": record.version,
+                "integrity_status": record.integrity_status,
+                "checked_at": record.checked_at,
+            },
+        )
     if not record.path.is_file():
         log.error("image for version %s is missing at %s", record.version, record.path)
         raise HTTPException(

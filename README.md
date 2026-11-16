@@ -27,10 +27,14 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | GET | `/api/v1/mosaics/current` | Current version metadata |
 | GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
+| GET | `/api/v1/mosaics/{version}/integrity` | Latest integrity verdict for a fixed version |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
+| POST | `/api/v1/integrity/scans` | Verify every registered version; save and return verdicts |
+| GET | `/api/v1/integrity/scans/latest` | Summary of the most recent integrity scan |
 | GET | `/healthz` | Liveness, database and current-version check |
 
-`/docs` supports submitting (multipart form), browsing and downloading.
+`/docs` supports submitting (multipart form), browsing, downloading, running a
+scan and reading scan/version integrity verdicts.
 
 ### Submitting
 
@@ -92,7 +96,58 @@ while a publication is in flight.
 
 Every version keeps its own immutable file, so `GET /api/v1/mosaics/{version}/download`
 always returns exactly the bytes registered under that version (with a stable
-SHA-256 `ETag`), including after restarts.
+SHA-256 `ETag`), including after restarts. A version quarantined by an
+integrity scan is the exception: its metadata stays available but downloads
+return `410 image_unavailable` until a later scan verifies the original bytes
+again.
+
+### Integrity verification
+
+`POST /api/v1/integrity/scans` re-checks every version that was registered
+when the scan started against the size and SHA-256 recorded at publication.
+The verdict for each version is `ok`, `missing` (no file) or `corrupt` (size or
+digest differs, or the file cannot be read). Conclusions are saved both per
+scan (`integrity_scans`, `integrity_results`) and as the latest state of each
+version (`version_integrity`), so they survive restarts.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/integrity/scans
+curl http://localhost:8000/api/v1/integrity/scans/latest
+curl http://localhost:8000/api/v1/mosaics/3/integrity
+```
+
+The scan response carries `scan_id`, `scanned_versions`, `counts`
+(`total`/`ok`/`missing`/`corrupt`), `current_before`/`current_after`,
+`fallback_applied`, the flat `results` list and the same entries grouped under
+`ok`, `missing` and `corrupt`. Each entry includes the expected and actual
+size/SHA-256 and a human-readable `detail`.
+
+Every version payload (`GET /api/v1/mosaics`, `.../current`, `.../{version}`,
+and the `201` response) now carries `downloadable` and an `integrity` object
+with `status` (`ok`, `missing`, `corrupt` or `unverified`), `verified`,
+`checked_at`, `scan_id` and `detail`. `unverified` means no scan has looked at
+that version yet; it stays downloadable so a freshly published version is not
+blocked while a scan runs.
+
+Rules for the current pointer and concurrency:
+
+* If the version that is current at scan start fails verification **and is
+  still current** when the results are applied, the pointer moves to the
+  highest-numbered older version that passed this same scan. With no such
+  version the current pointer is cleared (`current_version` is `0`).
+* Only versions registered at scan start are checked. A version published
+  while a scan runs is not in the snapshot: it is never rolled back, and it is
+  never chosen as a fallback because it was not verified by that scan.
+* The pointer is only ever moved *down* by a scan. Restoring a file to its
+  original bytes clears its quarantine on the next scan but never promotes it
+  back to current, so a later publication keeps precedence.
+* Hashing runs without a database write lock; verdicts are applied in one
+  short `BEGIN IMMEDIATE` transaction that re-reads the current pointer.
+  Concurrent scans within one process are serialised.
+
+A version that is `missing` or `corrupt` is still returned by the metadata
+endpoints; only its download is refused (`410 image_unavailable`, with the
+integrity status in the error detail).
 
 ### Errors
 
@@ -123,7 +178,10 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination, error handling, and
+integrity scans (clean/missing/corrupt verdicts, quarantine gating downloads,
+fallback selection, restored files, scan-time publication races and verdict
+persistence across restarts).
 
 ## Configuration
 

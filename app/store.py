@@ -1,4 +1,4 @@
-"""SQLite metadata store and atomic version publishing.
+"""SQLite metadata store, atomic version publishing and integrity checks.
 
 Version publication follows this sequence, all while holding a SQLite
 ``BEGIN IMMEDIATE`` write transaction:
@@ -15,14 +15,31 @@ Consequently the current pointer only moves after a complete image exists on
 disk.  A crash before commit leaves the previous version current and at worst
 an unreferenced file, which startup reconciliation removes.  Versions are
 never overwritten or deleted, so every published version stays downloadable.
+
+Integrity verification ("quarantine") is deliberately separate from
+publication.  A scan snapshots the registered versions and their expected size
+and SHA-256, hashes the files without holding a database write lock, and then
+applies the conclusions in one short write transaction.  Results are stored
+per scan plus as the latest state of each version.  A version found missing or
+corrupt stays queryable but is no longer downloadable until a later scan sees
+the original bytes again.
+
+The current pointer is only ever moved *down* by a scan: when the version that
+was current at scan start is still current when results are applied and it
+failed verification, the pointer moves to the highest-numbered older version
+that passed this same scan (or to 0 when there is none).  A version published
+while a scan is running therefore never gets rolled back, and a restored
+version never promotes itself back to current.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -62,10 +79,59 @@ CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS integrity_scans (
+    scan_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at       TEXT    NOT NULL,
+    finished_at      TEXT    NOT NULL,
+    scanned_versions TEXT    NOT NULL,
+    ok_count         INTEGER NOT NULL,
+    missing_count    INTEGER NOT NULL,
+    corrupt_count    INTEGER NOT NULL,
+    current_before   INTEGER NOT NULL,
+    current_after    INTEGER NOT NULL,
+    fallback_applied INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS integrity_results (
+    scan_id             INTEGER NOT NULL REFERENCES integrity_scans(scan_id),
+    version             INTEGER NOT NULL,
+    day                 TEXT    NOT NULL,
+    outcome             TEXT    NOT NULL CHECK (outcome IN ('ok', 'missing', 'corrupt')),
+    expected_sha256     TEXT    NOT NULL,
+    expected_size_bytes INTEGER NOT NULL,
+    actual_sha256       TEXT,
+    actual_size_bytes   INTEGER,
+    detail              TEXT,
+    PRIMARY KEY (scan_id, version)
+);
+
+-- Latest verification conclusion for each version.  A row is only created by
+-- a scan, so versions no scan has reached yet have no row (treated as
+-- unverified and therefore still downloadable).
+CREATE TABLE IF NOT EXISTS version_integrity (
+    version    INTEGER PRIMARY KEY,
+    outcome    TEXT    NOT NULL CHECK (outcome IN ('ok', 'missing', 'corrupt')),
+    scan_id    INTEGER NOT NULL REFERENCES integrity_scans(scan_id),
+    checked_at TEXT    NOT NULL,
+    detail     TEXT
+);
 """
 
 CURRENT_STATE_KEY = "current_version"
 ORPHAN_GRACE_SECONDS = 3600.0
+HASH_CHUNK_BYTES = 1024 * 1024
+
+# Serialises concurrent scan requests within this process.  SQLite still
+# guards the actual writes; this only avoids two full scans racing and doing
+# the same I/O twice.
+_scan_lock = threading.Lock()
+
+INTEGRITY_OK = "ok"
+INTEGRITY_MISSING = "missing"
+INTEGRITY_CORRUPT = "corrupt"
+INTEGRITY_UNVERIFIED = "unverified"
+INTEGRITY_OUTCOMES = (INTEGRITY_OK, INTEGRITY_MISSING, INTEGRITY_CORRUPT)
 
 
 class VersionConflict(Exception):
@@ -94,6 +160,24 @@ class DownloadRecord:
     day: str
     path: Path
     filename: str
+    sha256: str
+    size_bytes: int
+    # Latest scan verdict; ``unverified`` means no scan has seen it yet.
+    integrity_status: str = INTEGRITY_UNVERIFIED
+    checked_at: str | None = None
+
+    @property
+    def downloadable(self) -> bool:
+        return self.integrity_status in (INTEGRITY_OK, INTEGRITY_UNVERIFIED)
+
+
+@dataclass(frozen=True)
+class IntegrityRecord:
+    """Expected bytes for one version, as registered at scan start."""
+
+    version: int
+    day: str
+    path: Path
     sha256: str
     size_bytes: int
 
@@ -194,12 +278,51 @@ def _fetch_row(conn: sqlite3.Connection, version: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM versions WHERE version = ?", (version,)).fetchone()
 
 
-def _row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
+def _fetch_integrity_row(conn: sqlite3.Connection, version: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT outcome, scan_id, checked_at, detail FROM version_integrity WHERE version = ?",
+        (version,),
+    ).fetchone()
+
+
+def _integrity_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+    """Describe the latest scan conclusion for a version.
+
+    ``unverified`` means no completed scan has looked at this version yet; it
+    stays downloadable so a freshly published version is never blocked merely
+    because a scan has not run.
+    """
+    if row is None:
+        return {
+            "status": INTEGRITY_UNVERIFIED,
+            "verified": False,
+            "downloadable": True,
+            "checked_at": None,
+            "scan_id": None,
+            "detail": None,
+        }
+    status = row["outcome"]
+    return {
+        "status": status,
+        "verified": True,
+        "downloadable": status == INTEGRITY_OK,
+        "checked_at": row["checked_at"],
+        "scan_id": int(row["scan_id"]),
+        "detail": row["detail"],
+    }
+
+
+def _row_to_payload(
+    row: sqlite3.Row, integrity_row: sqlite3.Row | None = None
+) -> dict[str, Any]:
+    integrity = _integrity_payload(integrity_row)
     return {
         "version": int(row["version"]),
         "day": row["day"],
         "status": row["status"],
         "published_at": row["published_at"],
+        "downloadable": integrity["downloadable"],
+        "integrity": integrity,
         "image": {
             "width": int(row["width"]),
             "height": int(row["height"]),
@@ -226,7 +349,7 @@ def _current_payload(conn: sqlite3.Connection) -> tuple[int, dict[str, Any] | No
     row = _fetch_row(conn, version)
     if row is None:
         return 0, None
-    return version, _row_to_payload(row)
+    return version, _row_to_payload(row, _fetch_integrity_row(conn, version))
 
 
 def get_current_version(settings: Settings) -> int:
@@ -249,7 +372,9 @@ def get_version(settings: Settings, version: int) -> dict[str, Any] | None:
     conn = connect(settings)
     try:
         row = _fetch_row(conn, version)
-        return _row_to_payload(row) if row is not None else None
+        if row is None:
+            return None
+        return _row_to_payload(row, _fetch_integrity_row(conn, version))
     finally:
         conn.close()
 
@@ -273,9 +398,29 @@ def list_versions(
                 "SELECT * FROM versions WHERE day = ? ORDER BY version DESC LIMIT ? OFFSET ?",
                 (day, limit, offset),
             ).fetchall()
-        return [_row_to_payload(row) for row in rows], int(total)
+        return [
+            _row_to_payload(row, _fetch_integrity_row(conn, int(row["version"])))
+            for row in rows
+        ], int(total)
     finally:
         conn.close()
+
+
+def _download_record(
+    settings: Settings, row: sqlite3.Row, integrity_row: sqlite3.Row | None
+) -> DownloadRecord:
+    version = int(row["version"])
+    integrity = _integrity_payload(integrity_row)
+    return DownloadRecord(
+        version=version,
+        day=row["day"],
+        path=settings.versions_dir / f"v{version}.tif",
+        filename=f"rainmosaic-{row['day']}-v{version}.tif",
+        sha256=row["sha256"],
+        size_bytes=int(row["size_bytes"]),
+        integrity_status=integrity["status"],
+        checked_at=integrity["checked_at"],
+    )
 
 
 def get_download(settings: Settings, version: int) -> DownloadRecord | None:
@@ -284,14 +429,7 @@ def get_download(settings: Settings, version: int) -> DownloadRecord | None:
         row = _fetch_row(conn, version)
         if row is None:
             return None
-        return DownloadRecord(
-            version=int(row["version"]),
-            day=row["day"],
-            path=settings.versions_dir / f"v{int(row['version'])}.tif",
-            filename=f"rainmosaic-{row['day']}-v{int(row['version'])}.tif",
-            sha256=row["sha256"],
-            size_bytes=int(row["size_bytes"]),
-        )
+        return _download_record(settings, row, _fetch_integrity_row(conn, version))
     finally:
         conn.close()
 
@@ -305,14 +443,360 @@ def get_current_download(settings: Settings) -> DownloadRecord | None:
         row = _fetch_row(conn, version)
         if row is None:
             return None
-        return DownloadRecord(
+        return _download_record(settings, row, _fetch_integrity_row(conn, version))
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Integrity verification
+# --------------------------------------------------------------------------
+
+
+def _snapshot_versions(
+    settings: Settings, conn: sqlite3.Connection
+) -> tuple[int, list[IntegrityRecord]]:
+    """Registered versions at scan start and the current pointer then.
+
+    Reading the pointer and the rows in one short read transaction means a
+    concurrent publication either is fully visible (a new current version and
+    a new row) or not visible at all.
+    """
+
+    conn.execute("BEGIN")
+    try:
+        current_version = _read_pointer(conn)
+        rows = conn.execute(
+            "SELECT version, day, sha256, size_bytes FROM versions ORDER BY version"
+        ).fetchall()
+    finally:
+        _rollback(conn)
+    return current_version, [
+        IntegrityRecord(
             version=int(row["version"]),
             day=row["day"],
             path=settings.versions_dir / f"v{int(row['version'])}.tif",
-            filename=f"rainmosaic-{row['day']}-v{int(row['version'])}.tif",
             sha256=row["sha256"],
             size_bytes=int(row["size_bytes"]),
         )
+        for row in rows
+    ]
+
+
+def _check_record(record: IntegrityRecord) -> dict[str, Any]:
+    """Compare one file against its registered size and SHA-256."""
+
+    result: dict[str, Any] = {
+        "version": record.version,
+        "day": record.day,
+        "expected_sha256": record.sha256,
+        "expected_size_bytes": record.size_bytes,
+        "actual_sha256": None,
+        "actual_size_bytes": None,
+        "detail": None,
+    }
+    try:
+        stat = record.path.stat()
+    except FileNotFoundError:
+        result["outcome"] = INTEGRITY_MISSING
+        result["detail"] = "image file not found"
+        return result
+    except OSError as exc:
+        result["outcome"] = INTEGRITY_CORRUPT
+        result["detail"] = f"image file is unreadable: {exc}"
+        return result
+
+    if not record.path.is_file():
+        result["outcome"] = INTEGRITY_MISSING
+        result["detail"] = "image path is not a regular file"
+        return result
+
+    result["actual_size_bytes"] = int(stat.st_size)
+    if stat.st_size != record.size_bytes:
+        result["outcome"] = INTEGRITY_CORRUPT
+        result["detail"] = (
+            f"size mismatch: registered {record.size_bytes} bytes, "
+            f"found {stat.st_size} bytes"
+        )
+        return result
+
+    digest = hashlib.sha256()
+    try:
+        with record.path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        result["outcome"] = INTEGRITY_CORRUPT
+        result["detail"] = f"image file could not be read: {exc}"
+        return result
+
+    actual = digest.hexdigest()
+    result["actual_sha256"] = actual
+    if actual != record.sha256:
+        result["outcome"] = INTEGRITY_CORRUPT
+        result["detail"] = (
+            f"SHA-256 mismatch: registered {record.sha256}, found {actual}"
+        )
+        return result
+
+    result["outcome"] = INTEGRITY_OK
+    return result
+
+
+def run_integrity_scan(settings: Settings) -> dict[str, Any]:
+    """Verify every version registered when the scan starts.
+
+    Files are hashed without holding a write lock.  Conclusions are applied in
+    one short write transaction that re-reads the current pointer, so a
+    version published while the scan ran is never rolled back and a version
+    that failed earlier but was not part of this scan is never selected as a
+    fallback.
+    """
+
+    with _scan_lock:
+        started = datetime.now(timezone.utc)
+        conn = connect(settings)
+        try:
+            current_before, records = _snapshot_versions(settings, conn)
+        finally:
+            conn.close()
+
+        results = [_check_record(record) for record in records]
+
+        finished = datetime.now(timezone.utc)
+        counts = {outcome: 0 for outcome in INTEGRITY_OUTCOMES}
+        for result in results:
+            counts[result["outcome"]] += 1
+
+        conn = connect(settings)
+        try:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    raise PublishBusy() from exc
+                raise
+
+            current_after = _read_pointer(conn)
+            moved_to: int | None = None
+            if (
+                current_before > 0
+                and current_before == current_after
+                and any(
+                    result["version"] == current_before
+                    and result["outcome"] != INTEGRITY_OK
+                    for result in results
+                )
+            ):
+                # Only versions verified by *this* scan are eligible: a
+                # version published after the snapshot is absent from
+                # ``results`` and a version that failed an earlier scan has not
+                # been re-verified here either.
+                eligible = [
+                    result["version"]
+                    for result in results
+                    if result["version"] < current_before
+                    and result["outcome"] == INTEGRITY_OK
+                ]
+                moved_to = max(eligible) if eligible else 0
+                _write_pointer(conn, moved_to)
+                current_after = moved_to
+
+            cursor = conn.execute(
+                """
+                INSERT INTO integrity_scans (
+                    started_at, finished_at, scanned_versions, ok_count,
+                    missing_count, corrupt_count, current_before, current_after,
+                    fallback_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    iso_utc(started),
+                    iso_utc(finished),
+                    json.dumps([result["version"] for result in results]),
+                    counts[INTEGRITY_OK],
+                    counts[INTEGRITY_MISSING],
+                    counts[INTEGRITY_CORRUPT],
+                    current_before,
+                    current_after,
+                    int(moved_to is not None),
+                ),
+            )
+            scan_id = int(cursor.lastrowid)
+
+            for result in results:
+                conn.execute(
+                    """
+                    INSERT INTO integrity_results (
+                        scan_id, version, day, outcome, expected_sha256,
+                        expected_size_bytes, actual_sha256, actual_size_bytes,
+                        detail
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        result["version"],
+                        result["day"],
+                        result["outcome"],
+                        result["expected_sha256"],
+                        result["expected_size_bytes"],
+                        result["actual_sha256"],
+                        result["actual_size_bytes"],
+                        result["detail"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO version_integrity (
+                        version, outcome, scan_id, checked_at, detail
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(version) DO UPDATE SET
+                        outcome = excluded.outcome,
+                        scan_id = excluded.scan_id,
+                        checked_at = excluded.checked_at,
+                        detail = excluded.detail
+                    """,
+                    (
+                        result["version"],
+                        result["outcome"],
+                        scan_id,
+                        iso_utc(finished),
+                        result["detail"],
+                    ),
+                )
+            conn.execute("COMMIT")
+        except PublishBusy:
+            _rollback(conn)
+            raise
+        except Exception:
+            _rollback(conn)
+            raise
+        finally:
+            conn.close()
+
+        log.info(
+            "integrity scan %s checked %s versions: %s ok, %s missing, %s corrupt; "
+            "current %s -> %s",
+            scan_id,
+            len(results),
+            counts[INTEGRITY_OK],
+            counts[INTEGRITY_MISSING],
+            counts[INTEGRITY_CORRUPT],
+            current_before,
+            current_after,
+        )
+        return _scan_payload(
+            scan_id,
+            started=started,
+            finished=finished,
+            counts=counts,
+            results=results,
+            current_before=current_before,
+            current_after=current_after,
+            fallback_applied=moved_to is not None,
+        )
+
+
+def _scan_payload(
+    scan_id: int,
+    *,
+    started: datetime,
+    finished: datetime,
+    counts: dict[str, int],
+    results: list[dict[str, Any]],
+    current_before: int,
+    current_after: int,
+    fallback_applied: bool,
+) -> dict[str, Any]:
+    def view(result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": result["version"],
+            "day": result["day"],
+            "outcome": result["outcome"],
+            "status": result["outcome"],
+            "downloadable": result["outcome"] == INTEGRITY_OK,
+            "expected_sha256": result["expected_sha256"],
+            "expected_size_bytes": result["expected_size_bytes"],
+            "actual_sha256": result["actual_sha256"],
+            "actual_size_bytes": result["actual_size_bytes"],
+            "detail": result["detail"],
+        }
+
+    ordered = sorted(results, key=lambda item: item["version"])
+    return {
+        "scan_id": scan_id,
+        "started_at": iso_utc(started),
+        "finished_at": iso_utc(finished),
+        "scanned_versions": [result["version"] for result in ordered],
+        "status": (
+            "degraded"
+            if counts[INTEGRITY_MISSING] or counts[INTEGRITY_CORRUPT]
+            else INTEGRITY_OK
+        ),
+        "counts": {
+            "total": len(results),
+            "ok": counts[INTEGRITY_OK],
+            "missing": counts[INTEGRITY_MISSING],
+            "corrupt": counts[INTEGRITY_CORRUPT],
+        },
+        "current_before": current_before,
+        "current_after": current_after,
+        "current_version": current_after,
+        "fallback_applied": fallback_applied,
+        "ok": [view(result) for result in ordered if result["outcome"] == INTEGRITY_OK],
+        "missing": [
+            view(result) for result in ordered if result["outcome"] == INTEGRITY_MISSING
+        ],
+        "corrupt": [
+            view(result) for result in ordered if result["outcome"] == INTEGRITY_CORRUPT
+        ],
+        "results": [view(result) for result in ordered],
+    }
+
+
+def get_integrity(settings: Settings, version: int) -> dict[str, Any] | None:
+    """Latest integrity conclusion for a version, or ``None`` if unknown."""
+
+    conn = connect(settings)
+    try:
+        if _fetch_row(conn, version) is None:
+            return None
+        return _integrity_payload(_fetch_integrity_row(conn, version))
+    finally:
+        conn.close()
+
+
+def latest_scan(settings: Settings) -> dict[str, Any] | None:
+    """Summary of the most recent completed scan, or ``None`` if none ran."""
+
+    conn = connect(settings)
+    try:
+        row = conn.execute(
+            "SELECT * FROM integrity_scans ORDER BY scan_id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "scan_id": int(row["scan_id"]),
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "scanned_versions": json.loads(row["scanned_versions"]),
+            "status": (
+                "degraded"
+                if row["missing_count"] or row["corrupt_count"]
+                else INTEGRITY_OK
+            ),
+            "counts": {
+                "total": int(row["ok_count"] + row["missing_count"] + row["corrupt_count"]),
+                "ok": int(row["ok_count"]),
+                "missing": int(row["missing_count"]),
+                "corrupt": int(row["corrupt_count"]),
+            },
+            "current_before": int(row["current_before"]),
+            "current_after": int(row["current_after"]),
+            "current_version": int(row["current_after"]),
+            "fallback_applied": bool(row["fallback_applied"]),
+        }
     finally:
         conn.close()
 
